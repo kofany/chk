@@ -67,3 +67,4 @@ This project is licensed under the MIT License - see the [LICENSE](https://kofan
 
 - [ipinfo.io](https://ipinfo.io/) for providing IP information API
 - [fatih/color](https://github.com/fatih/color) for colorized console output
+- [alecthomas/kong](https://github.com/alecthomas/kong) for CLI argument parsing and help generation
