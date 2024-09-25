@@ -9,14 +9,10 @@ Features:
   - Fetch detailed IP information (city, region, country, etc.) using ipinfo.io API
   - Support for IPv4 and IPv6 addresses
   - Colorized output for better readability
-
-Usage:
-  chk [options] <domain/subdomain/IP>
-
-Options:
-  -4: Show only IPv4 (A) records
-  -6: Show only IPv6 (AAAA) records
-  -h or --help: Display help information
+  - Parallel processing using goroutines
+  - Configurable timeout handling for HTTP requests
+  - Graceful shutdown on user interrupt
+  - Progress information during execution
 
 GitHub Repository: https://github.com/kofany/chk
 
@@ -27,17 +23,28 @@ License: MIT License (https://kofany.mit-license.org)
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"github.com/fatih/color"
 )
+
+var CLI struct {
+	IPv4    bool          `help:"Show only IPv4 (A) records" short:"4"`
+	IPv6    bool          `help:"Show only IPv6 (AAAA) records" short:"6"`
+	Timeout time.Duration `help:"Timeout for HTTP requests" default:"5s"`
+	Target  string        `arg name:"domain/ip" help:"Domain, subdomain or IP to check"`
+}
 
 type IPInfo struct {
 	IP       string `json:"ip"`
@@ -50,11 +57,11 @@ type IPInfo struct {
 }
 
 type Result struct {
-	IP      string
-	PTR     []string
-	IPInfo  *IPInfo
-	IsIPv6  bool
-	Error   error
+	IP     string
+	PTR    []string
+	IPInfo *IPInfo
+	IsIPv6 bool
+	Error  error
 }
 
 var (
@@ -65,8 +72,15 @@ var (
 	magenta = color.New(color.FgMagenta).SprintFunc()
 )
 
-func getIPInfo(ip string) (*IPInfo, error) {
-	resp, err := http.Get("https://ipinfo.io/" + ip + "/json")
+var httpClient *http.Client
+
+func getIPInfo(ctx context.Context, ip string) (*IPInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://ipinfo.io/"+ip+"/json", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -79,28 +93,39 @@ func getIPInfo(ip string) (*IPInfo, error) {
 	return &ipInfo, nil
 }
 
-func lookupIP(ip string, isIPv6 bool) Result {
+func lookupIP(ctx context.Context, ip string, isIPv6 bool, resultChan chan<- Result, wg *sync.WaitGroup) {
+	defer wg.Done()
 	result := Result{IP: ip, IsIPv6: isIPv6}
 
-	names, err := net.LookupAddr(ip)
-	if err != nil {
-		result.Error = fmt.Errorf("error looking up PTR records: %v", err)
-	} else {
-		result.PTR = names
-	}
+	var wgInternal sync.WaitGroup
+	wgInternal.Add(2)
 
-	ipInfo, err := getIPInfo(ip)
-	if err != nil {
-		if result.Error != nil {
-			result.Error = fmt.Errorf("%v; error fetching IP info: %v", result.Error, err)
+	go func() {
+		defer wgInternal.Done()
+		names, err := net.LookupAddr(ip)
+		if err != nil {
+			result.Error = fmt.Errorf("error looking up PTR records: %v", err)
 		} else {
-			result.Error = fmt.Errorf("error fetching IP info: %v", err)
+			result.PTR = names
 		}
-	} else {
-		result.IPInfo = ipInfo
-	}
+	}()
 
-	return result
+	go func() {
+		defer wgInternal.Done()
+		ipInfo, err := getIPInfo(ctx, ip)
+		if err != nil {
+			if result.Error != nil {
+				result.Error = fmt.Errorf("%v; error fetching IP info: %v", result.Error, err)
+			} else {
+				result.Error = fmt.Errorf("error fetching IP info: %v", err)
+			}
+		} else {
+			result.IPInfo = ipInfo
+		}
+	}()
+
+	wgInternal.Wait()
+	resultChan <- result
 }
 
 func printResult(result Result) {
@@ -109,7 +134,7 @@ func printResult(result Result) {
 		recordType = "AAAA"
 	}
 	fmt.Printf("%s: %s\n", cyan(fmt.Sprintf("%s Record", recordType)), yellow(result.IP))
-	
+
 	if len(result.PTR) > 0 {
 		fmt.Printf("  %s: %s\n", cyan("PTR Records"), green(strings.Join(result.PTR, ", ")))
 	}
@@ -129,95 +154,98 @@ func printResult(result Result) {
 	fmt.Println()
 }
 
-func showHelp() {
-	fmt.Println(magenta("Extended DNS Check (chk) - Usage:"))
-	fmt.Println(yellow("  chk <domain/subdomain>") + "              - Show A and AAAA records and IP info")
-	fmt.Println(yellow("  chk -4 <domain/subdomain>") + "           - Show only A records and IP info")
-	fmt.Println(yellow("  chk -6 <domain/subdomain>") + "           - Show only AAAA records and IP info")
-	fmt.Println(yellow("  chk -h") + " or " + yellow("chk --help") + "              - Display this help")
+func validateInput(input string) error {
+	if net.ParseIP(input) != nil {
+		return nil
+	}
+	if _, err := net.LookupHost(input); err != nil {
+		return fmt.Errorf("invalid domain or IP address: %v", err)
+	}
+	return nil
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		showHelp()
-		os.Exit(1)
+	ctx := kong.Parse(&CLI)
+
+	if err := validateInput(CLI.Target); err != nil {
+		fmt.Printf("%s: %v\n", red("Error"), red(err))
+		ctx.Exit(1)
 	}
 
-	if os.Args[1] == "-h" || os.Args[1] == "--help" {
-		showHelp()
-		os.Exit(0)
-	}
+	httpClient = &http.Client{Timeout: CLI.Timeout}
 
-	var input string
-	var ipv4Only, ipv6Only bool
+	mainCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	switch os.Args[1] {
-	case "-4":
-		if len(os.Args) != 3 {
-			fmt.Println(red("Error: Missing argument for -4 option"))
-			os.Exit(1)
-		}
-		ipv4Only = true
-		input = os.Args[2]
-	case "-6":
-		if len(os.Args) != 3 {
-			fmt.Println(red("Error: Missing argument for -6 option"))
-			os.Exit(1)
-		}
-		ipv6Only = true
-		input = os.Args[2]
-	default:
-		input = os.Args[1]
-	}
+	// Setup signal handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\nInterrupt received, shutting down...")
+		cancel()
+	}()
 
-	ip := net.ParseIP(input)
+	ip := net.ParseIP(CLI.Target)
 
-	var results []Result
 	var wg sync.WaitGroup
+	resultChan := make(chan Result, 10) // Buffered channel
+	var results []Result
 
+	var ips []net.IP
 	if ip != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results = append(results, lookupIP(ip.String(), ip.To4() == nil))
-		}()
+		ips = append(ips, ip)
 	} else {
-		ips, err := net.LookupIP(input)
+		var err error
+		ips, err = net.LookupIP(CLI.Target)
 		if err != nil {
 			fmt.Printf("%s: %v\n", red("Error looking up IP for domain"), red(err))
-			os.Exit(1)
-		}
-
-		for _, ip := range ips {
-			isIPv6 := ip.To4() == nil
-			if (ipv4Only && !isIPv6) || (ipv6Only && isIPv6) || (!ipv4Only && !ipv6Only) {
-				wg.Add(1)
-				go func(ip net.IP) {
-					defer wg.Done()
-					results = append(results, lookupIP(ip.String(), isIPv6))
-				}(ip)
-			}
+			ctx.Exit(1)
 		}
 	}
+
+	totalIPs := 0
+	for _, ip := range ips {
+		isIPv6 := ip.To4() == nil
+		if (CLI.IPv4 && !isIPv6) || (CLI.IPv6 && isIPv6) || (!CLI.IPv4 && !CLI.IPv6) {
+			totalIPs++
+			wg.Add(1)
+			go lookupIP(mainCtx, ip.String(), isIPv6, resultChan, &wg)
+		}
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
 
 	done := make(chan bool)
 	go func() {
-		wg.Wait()
+		for result := range resultChan {
+			results = append(results, result)
+		}
 		close(done)
 	}()
 
 	fmt.Print(yellow("Checking records... Please wait"))
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	processed := 0
 	for {
 		select {
+		case <-mainCtx.Done():
+			fmt.Println("\nOperation cancelled")
+			return
 		case <-done:
-			fmt.Print("\r" + strings.Repeat(" ", 40) + "\r") // Clear the "Checking records..." message
+			fmt.Print("\r" + strings.Repeat(" ", 60) + "\r") // Clear the progress message
 			for _, result := range results {
 				printResult(result)
 			}
 			return
-		default:
-			fmt.Print(".")
-			time.Sleep(500 * time.Millisecond)
+		case <-ticker.C:
+			processed = len(results)
+			fmt.Printf("\rChecking records... %d/%d completed", processed, totalIPs)
 		}
 	}
 }
